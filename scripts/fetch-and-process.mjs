@@ -165,6 +165,7 @@ export async function fetchAndProcess({
   version,
   outputDir = './output',
   rgVersion = DEFAULT_RG_VERSION,
+  platforms = null,
 }) {
   const tmpDir = join(outputDir, '.tmp');
   await mkdir(tmpDir, { recursive: true });
@@ -174,9 +175,11 @@ export async function fetchAndProcess({
   const manifest = fetchJson(`${CDN_BASE}/${version}/manifest.json`);
   console.log(`  Build: ${manifest.buildDate}`);
 
-  // ── Step 2: Download all SEA binaries in parallel ──
-  console.log(`\n[2] Downloading ${SEA_PLATFORMS.length} SEA binaries (parallel)...`);
-  await Promise.all(SEA_PLATFORMS.map(async (platform) => {
+  // ── Step 2: Download SEA binaries ──
+  const activeSEA = platforms ? SEA_PLATFORMS.filter(p => platforms.includes(p)) : SEA_PLATFORMS;
+  const activeOut = platforms ? OUTPUT_PLATFORMS.filter(p => platforms.includes(p) || platforms.includes(PLATFORM_ALIAS[p])) : OUTPUT_PLATFORMS;
+  console.log(`\n[2] Downloading ${activeSEA.length} SEA binaries (parallel)...`);
+  await Promise.all(activeSEA.map(async (platform) => {
     const info = manifest.platforms[platform];
     if (!info) { console.log(`  [skip] ${platform}`); return; }
     const binDir = join(tmpDir, 'bins', platform);
@@ -189,7 +192,7 @@ export async function fetchAndProcess({
   console.log(`\n[3] Extracting and patching...`);
   const extractions = {};
 
-  for (const platform of SEA_PLATFORMS) {
+  for (const platform of activeSEA) {
     const info = manifest.platforms[platform];
     if (!info) continue;
     const binPath = join(tmpDir, 'bins', platform, info.binary);
@@ -247,8 +250,8 @@ export async function fetchAndProcess({
   const seccompDir = await downloadSeccomp(tmpDir);
 
   // ── Step 5: Build platform packages ──
-  console.log(`\n[5] Building ${OUTPUT_PLATFORMS.length} platform packages...`);
-  for (const platform of OUTPUT_PLATFORMS) {
+  console.log(`\n[5] Building ${activeOut.length} platform packages...`);
+  for (const platform of activeOut) {
     const source = PLATFORM_ALIAS[platform] || platform;
     const ext = extractions[source];
     if (!ext) { console.log(`  [skip] ${platform} — no extraction`); continue; }
@@ -275,7 +278,7 @@ export async function fetchAndProcess({
 
   console.log(`\n✓ Done. Output in ${outputDir}/`);
   console.log(`  main/          — @cometix/claude-code`);
-  for (const p of OUTPUT_PLATFORMS) {
+  for (const p of activeOut) {
     console.log(`  packages/${p}/  — @cometix/claude-code-${p}`);
   }
 }
@@ -292,6 +295,7 @@ if (isMain) {
     if (args[i] === '--version' && args[i+1]) flags.version = args[++i];
     else if (args[i] === '--output' && args[i+1]) flags.outputDir = args[++i];
     else if (args[i] === '--rg-version' && args[i+1]) flags.rgVersion = args[++i];
+    else if (args[i] === '--platforms' && args[i+1]) flags.platforms = args[++i].split(',');
     else if (args[i] === '--latest') flags.latest = true;
   }
 

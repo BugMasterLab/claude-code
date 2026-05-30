@@ -46,6 +46,7 @@ export async function buildMainPackage({
     },
     optionalDependencies: {
       ...optDeps,
+      'node-pty': '^1.1.0',
       '@img/sharp-darwin-arm64': '^0.34.2',
       '@img/sharp-darwin-x64': '^0.34.2',
       '@img/sharp-linux-arm': '^0.34.2',

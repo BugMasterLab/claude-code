@@ -13,12 +13,37 @@ if (typeof globalThis.Bun === "undefined") {
   function bunSpawn(args, opts = {}) {
     const cmd = args[0];
     const spawnArgs = args.slice(1);
+
+    // PTY mode: when opts.terminal is a BunTerminalPolyfill instance,
+    // delegate to node-pty via the terminal's _bind method
+    if (opts.terminal && typeof opts.terminal._bind === "function") {
+      const terminal = opts.terminal;
+      const ptyProc = terminal._bind(cmd, spawnArgs, {
+        cwd: opts.cwd, env: opts.env,
+      });
+      const exited = new Promise((resolve) => {
+        ptyProc.onExit(({ exitCode }) => resolve(exitCode ?? 1));
+      });
+      return {
+        pid: ptyProc.pid,
+        unref: () => {},
+        kill: (sig) => { try { ptyProc.kill(sig); } catch {} },
+        ref: () => {},
+        stdin: {
+          write: (d) => ptyProc.write(typeof d === "string" ? d : d.toString()),
+          destroyed: false,
+        },
+        stdout: null, stderr: null,
+        exited, exitCode: null,
+      };
+    }
+
     const nodeOpts = {
       cwd: opts.cwd,
       env: opts.env,
       stdio: opts.stdio || [
         opts.stdin || "ignore",
-        opts.stdout === "pipe" ? "pipe" : (opts.terminal ? "pipe" : "inherit"),
+        opts.stdout === "pipe" ? "pipe" : "inherit",
         opts.stderr === "ignore" ? "ignore" : (opts.stderr === "pipe" ? "pipe" : "inherit"),
       ],
       detached: opts.detached || false,
@@ -146,9 +171,49 @@ if (typeof globalThis.Bun === "undefined") {
 
     spawn: bunSpawn,
 
-    Terminal: class BunTerminalPolyfill {
-      constructor() { throw new Error("Bun.Terminal unavailable (running under Node.js polyfill)"); }
-    },
+    Terminal: (() => {
+      let _nodePty = null;
+      function loadPty() {
+        if (_nodePty !== null) return _nodePty;
+        try { _nodePty = require("node-pty"); } catch { _nodePty = false; }
+        return _nodePty;
+      }
+      class BunTerminalPolyfill {
+        constructor(opts = {}) {
+          this._cols = opts.cols || 80;
+          this._rows = opts.rows || 24;
+          this._dataCallback = opts.data || null;
+          this._pty = null;
+        }
+        _bind(cmd, args, spawnOpts) {
+          const pty = loadPty();
+          if (!pty) throw new Error("Bun.Terminal polyfill: install @xterm/node-pty");
+          this._pty = pty.spawn(cmd, args, {
+            name: spawnOpts?.env?.TERM || "xterm-256color",
+            cols: this._cols, rows: this._rows,
+            cwd: spawnOpts?.cwd || process.cwd(),
+            env: spawnOpts?.env || process.env,
+          });
+          if (this._dataCallback) {
+            this._pty.onData((data) => {
+              try { this._dataCallback(this, Buffer.from(data)); } catch {}
+            });
+          }
+          return this._pty;
+        }
+        resize(cols, rows) {
+          try { this._pty?.resize(Math.max(1, cols), Math.max(1, rows)); } catch {}
+        }
+        write(data) {
+          try { this._pty?.write(typeof data === "string" ? data : data.toString()); } catch {}
+        }
+        kill(sig) { try { this._pty?.kill(sig); } catch {} }
+        get pid() { return this._pty?.pid; }
+      }
+      // Expose loadPty for spawn integration
+      BunTerminalPolyfill._loadPty = loadPty;
+      return BunTerminalPolyfill;
+    })(),
 
     Transpiler: class BunTranspilerPolyfill {
       constructor() { throw new Error("Bun.Transpiler unavailable (running under Node.js polyfill)"); }

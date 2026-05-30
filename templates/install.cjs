@@ -86,6 +86,24 @@ function main() {
       console.error(`[@cometix/claude-code postinstall] Failed to copy vendor/: ${err.message}`);
     }
   }
+
+  // Fix node-pty spawn-helper execute permission.
+  // npm strips +x from non-bin files; without it pty.spawn() fails
+  // with "posix_spawnp failed" on unix. Windows uses .exe (no chmod needed).
+  try {
+    const { chmodSync } = require('fs');
+    const search = [
+      path.join(dest, 'node_modules', 'node-pty', 'prebuilds'),
+      path.join(dest, '..', 'node-pty', 'prebuilds'),
+    ];
+    for (const dir of search) {
+      if (!existsSync(dir)) continue;
+      for (const plat of readdirSync(dir)) {
+        const h = path.join(dir, plat, 'spawn-helper');
+        if (existsSync(h)) chmodSync(h, 0o755);
+      }
+    }
+  } catch {}
 }
 
 main();

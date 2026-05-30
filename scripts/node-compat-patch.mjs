@@ -62,6 +62,16 @@ export function addShebangHeader(code) {
   return '#!/usr/bin/env node\n' + code;
 }
 
+function findCommentHeaderEnd(code) {
+  // Use acorn to find the start of the first AST statement.
+  // Everything before it is the comment header (copyright, version, etc.)
+  try {
+    const ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module' });
+    if (ast.body.length > 0) return ast.body[0].start;
+  } catch {}
+  return 0;
+}
+
 // ──────────────────────────────────────────────
 //  P1/P2/P3 AST-based patching
 // ──────────────────────────────────────────────
@@ -212,7 +222,7 @@ export async function patchFile(inputPath, outputPath) {
 
   const s = result.stats;
   console.log(`[OK] P1: Patched ${s.p1Paths} fileURLToPath + ${s.p1Requires} createRequire`);
-  console.log(`[${s.p2 ? 'OK' : '! '}] P2: Bun.Transpiler guard ${s.p2 ? 'patched' : 'not found'}`);
+  console.log(`[${s.p2 ? 'OK' : '--'}] P2: Bun.Transpiler guard ${s.p2 ? 'patched' : 'not found (polyfill handles this)'}`);
   console.log(`[${s.p3 > 0 ? 'OK' : '! '}] P3: Patched ${s.p3} $bunfs require paths`);
   console.log(`[${s.p5 ? 'OK' : '! '}] P5: EMBEDDED_SEARCH_TOOLS guard ${s.p5 ? 'restored' : 'not found (may be Windows build)'}`);
 
@@ -227,8 +237,14 @@ export async function patchFile(inputPath, outputPath) {
   // Inject Bun polyfill shim (for versions that removed typeof Bun guards)
   const bunGuardCount = (code.match(/typeof Bun/g) || []).length;
   if (bunGuardCount < 10) {
-    const polyfill = readFileSync(join(__dirname, '..', 'templates', 'bun-polyfill.js'), 'utf8');
-    code = polyfill + '\n' + code;
+    let polyfill = readFileSync(join(__dirname, '..', 'templates', 'bun-polyfill.js'), 'utf8');
+    // Strip polyfill's own shebang — we'll add a unified one at the end
+    polyfill = polyfill.replace(/^#![^\n]*\n/, '');
+
+    // Insert polyfill after the comment header (copyright + version lines)
+    // so the shebang block stays at the top for readability
+    const commentEnd = findCommentHeaderEnd(code);
+    code = code.slice(0, commentEnd) + polyfill + '\n' + code.slice(commentEnd);
     console.log(`[OK] P6: Injected Bun polyfill shim (${bunGuardCount} guards < 10 threshold)`);
   } else {
     console.log(`[! ] P6: Bun polyfill skipped (${bunGuardCount} guards >= 10 — dual-runtime fallbacks present)`);

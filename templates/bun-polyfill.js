@@ -227,8 +227,9 @@ if (typeof globalThis.Bun === "undefined") {
     })(),
 
     Transpiler: class BunTranspilerPolyfill {
-      constructor() { throw new Error("Bun.Transpiler unavailable (running under Node.js polyfill)"); }
-      transformSync() { return ""; }
+      constructor(opts = {}) { this._loader = opts.loader || "js"; }
+      transformSync(code) { return typeof code === "string" ? code : ""; }
+      scanImports(code) { return []; }
     },
 
     listen: () => { throw new Error("Bun.listen unavailable (running under Node.js polyfill)"); },

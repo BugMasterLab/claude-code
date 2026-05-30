@@ -247,4 +247,43 @@ if (typeof globalThis.Bun === "undefined") {
 
     embeddedFiles: [],
   };
+
+  // Patch ws.WebSocket: convert Bun-style {proxy: url} to Node-style {agent: HttpsProxyAgent}
+  // Bun's ws natively supports a `proxy` option; Node's ws does not.
+  // Without this, WebSocket connections (e.g. voice_stream) bypass HTTPS_PROXY.
+  //
+  // Bundled code uses: UfH = m(require("ws")); new UfH.default(url, opts)
+  // UfH.default = require("ws") = the WebSocket class itself.
+  // We must replace the class in require.cache so m() picks up the patched version.
+  try {
+    const _ws = require("ws");
+    const _OrigWS = _ws.WebSocket || _ws;
+
+    const _PatchedWS = function(url, protocols, opts) {
+      if (typeof protocols === "object" && !Array.isArray(protocols) && protocols !== null) {
+        opts = protocols; protocols = undefined;
+      }
+      if (opts?.proxy && !opts.agent) {
+        // __HttpsProxyAgent is exposed by P7 AST patch from bundled cli.js
+        const Agent = globalThis.__HttpsProxyAgent;
+        if (Agent) opts = { ...opts, agent: new Agent(opts.proxy) };
+        delete opts.proxy;
+      }
+      if (protocols !== undefined) return new _OrigWS(url, protocols, opts);
+      return new _OrigWS(url, opts);
+    };
+    Object.setPrototypeOf(_PatchedWS, _OrigWS);
+    Object.setPrototypeOf(_PatchedWS.prototype, _OrigWS.prototype);
+    for (const k of ["CONNECTING","OPEN","CLOSING","CLOSED","Server","WebSocketServer","createWebSocketStream","WebSocket"])
+      if (_OrigWS[k] !== undefined) _PatchedWS[k] = _OrigWS[k];
+    _PatchedWS.WebSocket = _PatchedWS;
+
+    // Replace in require.cache so m(require("ws")).default picks up the patch
+    const _wsPath = require.resolve("ws");
+    if (require.cache[_wsPath]) {
+      require.cache[_wsPath].exports = _PatchedWS;
+      require.cache[_wsPath].exports.WebSocket = _PatchedWS;
+      require.cache[_wsPath].exports.default = _PatchedWS;
+    }
+  } catch {}
 }

@@ -87,7 +87,7 @@ function isHardcodedBuildPath(node) {
 export function astPatch(code) {
   const ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'script' });
   const replacements = [];
-  const stats = { p1Paths: 0, p1Requires: 0, p2: false, p3: 0, p5: false };
+  const stats = { p1Paths: 0, p1Requires: 0, p2: false, p3: 0, p5: false, p7: false };
 
   walk(ast, (node) => {
     // P1: fileURLToPath("file:///home/runner/...") → __filename
@@ -197,6 +197,34 @@ export function astPatch(code) {
         }
       }
     }
+
+    // P7: Expose bundled HttpsProxyAgent as globalThis.__HttpsProxyAgent
+    //
+    // Bun's ws supports {proxy: url} natively; Node's ws does not.
+    // The polyfill patches ws.WebSocket to convert proxy → agent, but needs
+    // HttpsProxyAgent which is already bundled in cli.js.
+    //
+    // AST pattern:
+    //   AssignmentExpression: <exports>.HttpsProxyAgent = <Identifier>
+    //   where the RHS is the class reference
+    //
+    // Fix: append globalThis.__HttpsProxyAgent = <Identifier> after the assignment
+    if (!stats.p7 &&
+        node.type === 'AssignmentExpression' &&
+        node.operator === '=' &&
+        node.left?.type === 'MemberExpression' &&
+        node.left.property?.type === 'Identifier' &&
+        node.left.property.name === 'HttpsProxyAgent' &&
+        node.right?.type === 'Identifier') {
+      const className = node.right.name;
+      replacements.push({
+        start: node.end,
+        end: node.end,
+        replacement: `;globalThis.__HttpsProxyAgent=${className}`,
+      });
+      stats.p7 = true;
+      return;
+    }
   });
 
   const patched = applyReplacements(code, replacements);
@@ -225,6 +253,7 @@ export async function patchFile(inputPath, outputPath) {
   console.log(`[${s.p2 ? 'OK' : '--'}] P2: Bun.Transpiler guard ${s.p2 ? 'patched' : 'not found (polyfill handles this)'}`);
   console.log(`[${s.p3 > 0 ? 'OK' : '! '}] P3: Patched ${s.p3} $bunfs require paths`);
   console.log(`[${s.p5 ? 'OK' : '! '}] P5: EMBEDDED_SEARCH_TOOLS guard ${s.p5 ? 'restored' : 'not found (may be Windows build)'}`);
+  console.log(`[${s.p7 ? 'OK' : '! '}] P7: HttpsProxyAgent ${s.p7 ? 'exposed as globalThis.__HttpsProxyAgent' : 'not found'}`);
 
   // AST validation
   try {

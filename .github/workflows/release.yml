@@ -191,9 +191,23 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
           scope: '@cometix'
 
+      - name: Determine publish tag
+        id: publish-tag
+        run: |
+          VERSION="${{ matrix.version }}"
+          LATEST=$(npm view "@cometix/claude-code" version 2>/dev/null || echo "0.0.0")
+          if npx semver "$VERSION" -r ">$LATEST" &>/dev/null; then
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "Version $VERSION > latest ($LATEST), will publish as latest"
+          else
+            echo "tag=--tag backfill" >> "$GITHUB_OUTPUT"
+            echo "Version $VERSION <= latest ($LATEST), will publish with --tag backfill"
+          fi
+
       - name: Publish platform packages
         run: |
           VERSION="${{ matrix.version }}"
+          TAG_FLAG="${{ steps.publish-tag.outputs.tag }}"
           for tgz in ./artifacts/cometix-claude-code-*-${VERSION}.tgz; do
             [ -f "$tgz" ] || continue
             PKG=$(basename "$tgz" | sed "s/-${VERSION}.tgz//" | sed 's/^cometix-/@cometix\//')
@@ -201,13 +215,14 @@ jobs:
             if npm view "${PKG}@${VERSION}" version &>/dev/null 2>&1; then
               echo "  Already published, skipping"
             else
-              npx npm@latest publish "$tgz" --access public --provenance || echo "  Failed (may need package init)"
+              npx npm@latest publish "$tgz" --access public --provenance $TAG_FLAG || echo "  Failed (may need package init)"
             fi
           done
 
       - name: Publish main package
         run: |
           VERSION="${{ matrix.version }}"
+          TAG_FLAG="${{ steps.publish-tag.outputs.tag }}"
           TARBALL="./artifacts/cometix-claude-code-${VERSION}.tgz"
           if [ ! -f "$TARBALL" ]; then
             echo "Tarball not found: $TARBALL"
@@ -217,6 +232,6 @@ jobs:
           if npm view "@cometix/claude-code@${VERSION}" version &>/dev/null 2>&1; then
             echo "Already published, skipping"
           else
-            npx npm@latest publish "$TARBALL" --access public --provenance
+            npx npm@latest publish "$TARBALL" --access public --provenance $TAG_FLAG
             echo "Published @cometix/claude-code@${VERSION}"
           fi

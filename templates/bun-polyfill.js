@@ -412,29 +412,11 @@ if (typeof globalThis.Bun === "undefined") {
     }
   }
 
-  // ──────────────────────────────────────────────
-  // Bun.JSONL.parseChunk — minimal streaming JSONL parser
-  // ──────────────────────────────────────────────
-  function jsonlParseChunk(text, opts = {}) {
-    // Returns { values, error, done? } shape loosely compatible with Bun.JSONL.parseChunk
-    if (typeof text !== "string" || text.length === 0) {
-      return { values: [], error: null };
-    }
-    const values = [];
-    const lines = text.split(/\r?\n/);
-    // If text doesn't end with newline, last line may be partial
-    const complete = text.endsWith("\n") || text.endsWith("\r\n");
-    const toParse = complete ? lines.filter((l) => l.length > 0) : lines.slice(0, -1).filter((l) => l.length > 0);
-    const rest = complete ? "" : (lines[lines.length - 1] || "");
-    try {
-      for (const line of toParse) {
-        values.push(JSON.parse(line));
-      }
-      return { values, error: null, rest };
-    } catch (e) {
-      return { values, error: e, rest };
-    }
-  }
+  // Bun.JSONL.parseChunk is intentionally null.
+  // The business code (pYe → r0m) checks `Bun.JSONL?.parseChunk` and falls
+  // back to a pure-JS line-by-line JSON.parse loop (i0m/o0m) when it's null.
+  // A polyfill that returns { values, error } without `.read` / `.done` causes
+  // the n0m consumer to infinite-loop because `read` is undefined.
 
   // ──────────────────────────────────────────────
   // Bun.stdin
@@ -512,9 +494,7 @@ if (typeof globalThis.Bun === "undefined") {
       stringify: (obj, replacer, indent) => { return require("yaml").stringify(obj, replacer, indent); },
     },
 
-    JSONL: {
-      parseChunk: jsonlParseChunk,
-    },
+    JSONL: { parseChunk: null },
 
     which: (cmd) => {
       // Vendor directory lookup for bundled binaries.

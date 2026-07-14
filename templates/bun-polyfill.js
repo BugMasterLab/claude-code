@@ -1,15 +1,88 @@
 // Bun API polyfill for Node.js runtime
 // Injected at the top of cli.js when Bun is not available
-// Provides compatible implementations of Bun-specific APIs
+// Provides compatible implementations of Bun-specific APIs used by Claude Code 2.1.200+
 
 if (typeof globalThis.Bun === "undefined") {
   const crypto = require("crypto");
   const cp = require("child_process");
+  const fs = require("fs");
+  const net = require("net");
+  const http = require("http");
+  const https = require("https");
   const { Readable } = require("stream");
+  const util = require("util");
 
+  const BUN_FILE = Symbol.for("bun.polyfill.file");
+
+  // ──────────────────────────────────────────────
+  // Bun.file — used as stdio target (bg-pty-host breadcrumb)
+  // ──────────────────────────────────────────────
+  function bunFile(path, opts = {}) {
+    const p = typeof path === "string" ? path : String(path ?? "");
+    return {
+      [BUN_FILE]: true,
+      path: p,
+      name: p,
+      // Node child_process accepts path strings for stdio file targets
+      toString: () => p,
+      valueOf: () => p,
+      // Minimal Blob-like surface if something probes it
+      size: 0,
+      type: opts.type || "",
+      async text() {
+        return fs.promises.readFile(p, "utf8");
+      },
+      async arrayBuffer() {
+        const buf = await fs.promises.readFile(p);
+        return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+      },
+      stream() {
+        return fs.createReadStream(p);
+      },
+    };
+  }
+
+  function isBunFile(v) {
+    return !!(v && typeof v === "object" && v[BUN_FILE]);
+  }
+
+  // Node child_process does NOT accept filesystem path strings for async
+  // spawn stdio (only pipe/ignore/inherit/stream/fd). Bun.file(path) must be
+  // opened to an fd, matching pre-2.1.200 openSync(...err) behavior.
+  function normalizeStdioEntry(entry, openedFds) {
+    if (entry == null) return "ignore";
+    if (isBunFile(entry)) {
+      const fd = fs.openSync(entry.path, "w");
+      openedFds.push(fd);
+      return fd;
+    }
+    if (typeof entry === "object" && typeof entry.fd === "number") return entry.fd;
+    return entry;
+  }
+
+  function buildNodeStdio(opts = {}, openedFds) {
+    if (Array.isArray(opts.stdio)) {
+      return opts.stdio.map((e) => normalizeStdioEntry(e, openedFds));
+    }
+    // Bun allows top-level stdin/stdout/stderr (including Bun.file)
+    const stdin = opts.stdin !== undefined ? opts.stdin : "ignore";
+    const stdout = opts.stdout === "pipe" ? "pipe"
+      : (opts.stdout !== undefined ? opts.stdout : "inherit");
+    const stderr = opts.stderr === "ignore" ? "ignore"
+      : (opts.stderr === "pipe" ? "pipe"
+        : (opts.stderr !== undefined ? opts.stderr : "inherit"));
+    return [
+      normalizeStdioEntry(stdin, openedFds),
+      normalizeStdioEntry(stdout, openedFds),
+      normalizeStdioEntry(stderr, openedFds),
+    ];
+  }
+
+  // ──────────────────────────────────────────────
   // Bun.spawn polyfill
   // Returns an object mimicking Bun.Subprocess interface:
-  //   .pid, .unref(), .kill(), .exited (Promise<number>), .stdout.text() (Promise<string>)
+  //   .pid, .unref(), .kill(), .exited (Promise<number>), .stdout.text()
+  // ──────────────────────────────────────────────
   function bunSpawn(args, opts = {}) {
     const cmd = args[0];
     const spawnArgs = args.slice(1);
@@ -43,24 +116,28 @@ if (typeof globalThis.Bun === "undefined") {
       return result;
     }
 
-    const nodeOpts = {
-      cwd: opts.cwd,
-      env: opts.env,
-      stdio: opts.stdio || [
-        opts.stdin || "ignore",
-        opts.stdout === "pipe" ? "pipe" : "inherit",
-        opts.stderr === "ignore" ? "ignore" : (opts.stderr === "pipe" ? "pipe" : "inherit"),
-      ],
-      detached: opts.detached || false,
-      windowsHide: opts.windowsHide ?? true,
-    };
+    const openedFds = [];
+    let child;
+    try {
+      const nodeOpts = {
+        cwd: opts.cwd,
+        env: opts.env,
+        stdio: buildNodeStdio(opts, openedFds),
+        detached: opts.detached || false,
+        windowsHide: opts.windowsHide ?? true,
+      };
 
-    // argv0 support
-    if (opts.argv0) {
-      nodeOpts.argv0 = opts.argv0;
+      if (opts.argv0) {
+        nodeOpts.argv0 = opts.argv0;
+      }
+
+      child = cp.spawn(cmd, spawnArgs, nodeOpts);
+    } finally {
+      // Parent can close its copies; the child inherits dup'd fds.
+      for (const fd of openedFds) {
+        try { fs.closeSync(fd); } catch {}
+      }
     }
-
-    const child = cp.spawn(cmd, spawnArgs, nodeOpts);
 
     // Build stdout with .text() method (mimics Bun ReadableStream)
     let stdout = null;
@@ -77,7 +154,6 @@ if (typeof globalThis.Bun === "undefined") {
       };
     }
 
-    // exited promise
     const result = {
       pid: child.pid,
       unref: () => child.unref(),
@@ -101,14 +177,14 @@ if (typeof globalThis.Bun === "undefined") {
     return result;
   }
 
-  // Bun.hash polyfill using wyhash-compatible behavior
-  // Returns number (not bigint) for compatibility
+  // ──────────────────────────────────────────────
+  // Bun.hash
+  // ──────────────────────────────────────────────
   function bunHash(data, seed) {
     const str = typeof data === "string" ? data : String(data);
     const h = crypto.createHash("sha256").update(str);
     if (seed !== undefined) h.update(String(seed));
     const buf = h.digest();
-    // Return a numeric hash (first 8 bytes as number, matching Bun.hash range)
     return Number(buf.readBigUInt64LE(0) & 0xFFFFFFFFn);
   }
   bunHash.toString = () => "function hash() { [native code] }";
@@ -117,16 +193,284 @@ if (typeof globalThis.Bun === "undefined") {
   let _inkCompat = null;
   try { _inkCompat = require("./bun-ink-compat.cjs"); } catch {}
 
-  // ANSI escape regex (fallback if compat module unavailable)
   const ANSI_RE = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
+
+  // ──────────────────────────────────────────────
+  // Bun.deepEquals
+  // ──────────────────────────────────────────────
+  function deepEquals(a, b) {
+    if (a === b) return true;
+    try {
+      return util.isDeepStrictEqual(a, b);
+    } catch {
+      return false;
+    }
+  }
+
+  // ──────────────────────────────────────────────
+  // Bun.listen — TCP server with Bun-like socket handlers
+  // ──────────────────────────────────────────────
+  function bunListen(opts = {}) {
+    const handlers = opts.socket || {};
+    const server = net.createServer((sock) => {
+      const wrapper = {
+        data: undefined,
+        write(data) {
+          const buf = typeof data === "string" ? Buffer.from(data, "utf8")
+            : Buffer.isBuffer(data) ? data
+            : Buffer.from(data);
+          if (sock.destroyed) return 0;
+          // Node already buffers when write() returns false; always report full
+          // acceptance to avoid caller-side double-buffer + re-write on drain.
+          sock.write(buf);
+          return buf.length;
+        },
+        end() {
+          try { sock.end(); } catch {}
+        },
+        terminate() {
+          try { sock.destroy(); } catch {}
+        },
+        get readyState() {
+          if (sock.destroyed) return 3;
+          if (sock.connecting) return 0;
+          return 1;
+        },
+        get remoteAddress() { return sock.remoteAddress; },
+        get remotePort() { return sock.remotePort; },
+        get localAddress() { return sock.localAddress; },
+        get localPort() { return sock.localPort; },
+      };
+
+      try { handlers.open?.(wrapper); } catch {}
+
+      sock.on("data", (chunk) => {
+        try { handlers.data?.(wrapper, chunk); } catch {}
+      });
+      sock.on("drain", () => {
+        try { handlers.drain?.(wrapper); } catch {}
+      });
+      sock.on("close", () => {
+        try { handlers.close?.(wrapper); } catch {}
+      });
+      sock.on("error", (err) => {
+        try { handlers.error?.(wrapper, err); } catch {}
+      });
+    });
+
+    const host = opts.hostname || opts.host || "127.0.0.1";
+    const port = opts.port ?? 0;
+    // Track bound address; Bun.listen returns a usable port synchronously.
+    let bound = { address: host, port };
+    server.listen(port, host);
+    try {
+      const addr = server.address();
+      if (addr && typeof addr === "object") bound = addr;
+    } catch {}
+    server.on("listening", () => {
+      try {
+        const addr = server.address();
+        if (addr && typeof addr === "object") bound = addr;
+      } catch {}
+    });
+
+    const api = {
+      get port() {
+        const addr = server.address();
+        if (addr && typeof addr === "object") return addr.port;
+        return bound.port;
+      },
+      get hostname() {
+        const addr = server.address();
+        if (addr && typeof addr === "object") return addr.address;
+        return bound.address;
+      },
+      stop(closeActive) {
+        if (closeActive) {
+          try { server.closeAllConnections?.(); } catch {}
+        }
+        try { server.close(); } catch {}
+      },
+      ref() { try { server.ref(); } catch {} },
+      unref() { try { server.unref(); } catch {} },
+    };
+    return api;
+  }
+
+  // ──────────────────────────────────────────────
+  // Bun.serve — HTTP(S) server with fetch handler
+  // ──────────────────────────────────────────────
+  function bunServe(opts = {}) {
+    const host = opts.hostname || opts.host || "0.0.0.0";
+    const port = opts.port ?? 3000;
+    const fetchHandler = opts.fetch;
+    const errorHandler = opts.error;
+
+    async function nodeReqToFetchRequest(req) {
+      const hostHeader = req.headers.host || `${host}:${port}`;
+      const proto = opts.tls ? "https" : "http";
+      const url = `${proto}://${hostHeader}${req.url || "/"}`;
+      const headers = new Headers();
+      for (const [k, v] of Object.entries(req.headers)) {
+        if (v == null) continue;
+        if (Array.isArray(v)) v.forEach((item) => headers.append(k, item));
+        else headers.set(k, v);
+      }
+      const method = req.method || "GET";
+      let body = null;
+      if (method !== "GET" && method !== "HEAD") {
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        body = Buffer.concat(chunks);
+      }
+      return new Request(url, { method, headers, body });
+    }
+
+    async function writeFetchResponse(res, response) {
+      if (!response) {
+        res.statusCode = 500;
+        res.end("internal error");
+        return;
+      }
+      res.statusCode = response.status || 200;
+      response.headers?.forEach?.((value, key) => {
+        // set-cookie must not be joined
+        if (String(key).toLowerCase() === "set-cookie") {
+          const prev = res.getHeader("set-cookie");
+          if (!prev) res.setHeader("set-cookie", value);
+          else res.setHeader("set-cookie", [].concat(prev, value));
+        } else {
+          res.setHeader(key, value);
+        }
+      });
+      if (response.body) {
+        const buf = Buffer.from(await response.arrayBuffer());
+        res.end(buf);
+      } else {
+        res.end();
+      }
+    }
+
+    const handler = async (req, res) => {
+      try {
+        const request = await nodeReqToFetchRequest(req);
+        const serverShim = {
+          requestIP(requestObj) {
+            const addr = req.socket?.remoteAddress;
+            return addr ? { address: addr, family: req.socket.remoteFamily, port: req.socket.remotePort } : null;
+          },
+        };
+        let response = await fetchHandler(request, serverShim);
+        await writeFetchResponse(res, response);
+      } catch (err) {
+        try {
+          if (errorHandler) {
+            const response = await errorHandler(err);
+            await writeFetchResponse(res, response);
+            return;
+          }
+        } catch {}
+        res.statusCode = 500;
+        res.end("internal server error");
+      }
+    };
+
+    let server;
+    if (opts.tls) {
+      server = https.createServer(opts.tls, handler);
+    } else {
+      server = http.createServer(handler);
+    }
+    server.listen(port, host);
+
+    return {
+      get port() {
+        const addr = server.address();
+        return typeof addr === "object" && addr ? addr.port : port;
+      },
+      get hostname() {
+        const addr = server.address();
+        return typeof addr === "object" && addr ? addr.address : host;
+      },
+      stop(closeActive) {
+        if (closeActive) {
+          try { server.closeAllConnections?.(); } catch {}
+        }
+        try { server.close(); } catch {}
+      },
+      ref() { try { server.ref(); } catch {} },
+      unref() { try { server.unref(); } catch {} },
+    };
+  }
+
+  // ──────────────────────────────────────────────
+  // Bun.SQL — not implemented; clear error (gateway expects native)
+  // ──────────────────────────────────────────────
+  class BunSQLPolyfill {
+    constructor() {
+      throw new Error("claude gateway requires the native binary");
+    }
+  }
+
+  // ──────────────────────────────────────────────
+  // Bun.JSONL.parseChunk — minimal streaming JSONL parser
+  // ──────────────────────────────────────────────
+  function jsonlParseChunk(text, opts = {}) {
+    // Returns { values, error, done? } shape loosely compatible with Bun.JSONL.parseChunk
+    if (typeof text !== "string" || text.length === 0) {
+      return { values: [], error: null };
+    }
+    const values = [];
+    const lines = text.split(/\r?\n/);
+    // If text doesn't end with newline, last line may be partial
+    const complete = text.endsWith("\n") || text.endsWith("\r\n");
+    const toParse = complete ? lines.filter((l) => l.length > 0) : lines.slice(0, -1).filter((l) => l.length > 0);
+    const rest = complete ? "" : (lines[lines.length - 1] || "");
+    try {
+      for (const line of toParse) {
+        values.push(JSON.parse(line));
+      }
+      return { values, error: null, rest };
+    } catch (e) {
+      return { values, error: e, rest };
+    }
+  }
+
+  // ──────────────────────────────────────────────
+  // Bun.stdin
+  // ──────────────────────────────────────────────
+  const bunStdin = {
+    stream() {
+      return Readable.toWeb ? Readable.toWeb(process.stdin) : process.stdin;
+    },
+    async text() {
+      const chunks = [];
+      for await (const c of process.stdin) chunks.push(c);
+      return Buffer.concat(chunks).toString("utf8");
+    },
+  };
+
+  // ──────────────────────────────────────────────
+  // Bun.WebView — guarded no-op surface
+  // ──────────────────────────────────────────────
+  const BunWebView = {
+    closeAll() { return true; },
+  };
 
   globalThis.Bun = {
     version: "polyfill",
+    revision: "polyfill",
+    // SEA extraction always runs as Node package — never standalone executable
+    isStandaloneExecutable: false,
+
+    file: bunFile,
 
     hash: function hash(data, seed) {
       if (arguments.length === 1) return bunHash(data);
       return bunHash(data, seed);
     },
+
+    deepEquals,
 
     stripANSI: (str) => {
       if (_inkCompat?.stripANSI) return _inkCompat.stripANSI(str);
@@ -168,7 +512,9 @@ if (typeof globalThis.Bun === "undefined") {
       stringify: (obj, replacer, indent) => { return require("yaml").stringify(obj, replacer, indent); },
     },
 
-    JSONL: { parseChunk: null },
+    JSONL: {
+      parseChunk: jsonlParseChunk,
+    },
 
     which: (cmd) => {
       // Vendor directory lookup for bundled binaries.
@@ -185,7 +531,6 @@ if (typeof globalThis.Bun === "undefined") {
         if (!disabled) {
           try {
             const path = require("path");
-            const fs = require("fs");
             const archDir = process.arch + "-" + process.platform;
             const bin = process.platform === "win32" ? "rg.exe" : "rg";
             const vendorPath = path.join(__dirname, "vendor", "ripgrep", archDir, bin);
@@ -255,15 +600,26 @@ if (typeof globalThis.Bun === "undefined") {
       scanImports(code) { return []; }
     },
 
-    listen: () => { throw new Error("Bun.listen unavailable (running under Node.js polyfill)"); },
+    listen: bunListen,
+    serve: bunServe,
+    SQL: BunSQLPolyfill,
+    stdin: bunStdin,
+    WebView: BunWebView,
 
     gc: (full) => {
       if (typeof global.gc === "function") global.gc(full ? { type: "major" } : undefined);
     },
 
-    generateHeapSnapshot: () => {
+    generateHeapSnapshot: (format, encoding) => {
       try {
         const v8 = require("v8");
+        // Bun.generateHeapSnapshot("v8", "arraybuffer") is written via writeFileSync
+        if (encoding === "arraybuffer" || format === "v8") {
+          const stats = v8.getHeapStatistics();
+          const json = JSON.stringify({ polyfill: true, statistics: stats });
+          const buf = Buffer.from(json, "utf8");
+          return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+        }
         return v8.getHeapStatistics();
       } catch { return {}; }
     },

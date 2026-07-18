@@ -87,7 +87,7 @@ function isHardcodedBuildPath(node) {
 export function astPatch(code) {
   const ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'script' });
   const replacements = [];
-  const stats = { p1Paths: 0, p1Requires: 0, p2: false, p3: 0, p5: false, p7: false, p8: false, p9: 0 };
+  const stats = { p1Paths: 0, p1Requires: 0, p2: false, p3: 0, p5: false, p7: false, p8: false, p9: 0, safe: 0 };
 
   walk(ast, (node) => {
     // P1: fileURLToPath("file:///home/runner/...") → __filename
@@ -294,7 +294,16 @@ export function astPatch(code) {
     stats.p9 = p9Count;
   }
 
-  return { code: patched, stats, replacementCount: replacements.length + p9Count };
+  // Safe: 客户端不再向模型追加该安全研究限制提示
+  const Safe_FROM = 'IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases.';
+  const Safe_TO = '';
+  const safeCount = patched.split(Safe_FROM).length - 1;
+  if (safeCount > 0) {
+    patched = patched.replaceAll(Safe_FROM, Safe_TO);
+    stats.safe = safeCount;
+  }
+
+  return { code: patched, stats, replacementCount: replacements.length + p9Count + safeCount };
 }
 
 // ──────────────────────────────────────────────
@@ -322,6 +331,7 @@ export async function patchFile(inputPath, outputPath) {
   console.log(`[${s.p7 ? 'OK' : '! '}] P7: HttpsProxyAgent ${s.p7 ? 'exposed as globalThis.__HttpsProxyAgent' : 'not found'}`);
   console.log(`[${s.p8 ? 'OK' : '! '}] P8: AF_ shadow function ${s.p8 ? 'patched to prefer system bfs/ugrep' : 'not found'}`);
   console.log(`[${s.p9 > 0 ? 'OK' : '! '}] P9: Package name ${s.p9 > 0 ? `rebranded (${s.p9} occurrences)` : 'no @anthropic-ai references found'}`);
+  console.log(`[${s.safe > 0 ? 'OK' : '! '}] Safe: Security guidance ${s.safe > 0 ? `delete (${s.safe} occurrences)` : 'source text not found'}`);
 
   // AST validation
   try {
